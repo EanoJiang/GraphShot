@@ -1,0 +1,29 @@
+# ===== Build artifacts (never commit) =====
+Binaries/
+Intermediate/
+DerivedDataCache/
+Saved/
+*.pdb
+*.dll
+*.modules
+
+# ===== Build systems / tooling =====
+.vs/
+.vscode/
+.idea/
+*.sln
+*.suo
+*.vcxproj*
+GeneratedProjectFiles/
+project_files/
+
+# ===== OS =====
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ===== Editor / IDE state =====
+*.user
+*.opensdf
+*.sdf
+*.VC.db
