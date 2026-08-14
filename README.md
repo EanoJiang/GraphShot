@@ -1,5 +1,7 @@
 # GraphShot
 
+> Github仓库：[github.com/EanoJiang/GraphShot](https://github.com/EanoJiang/GraphShot)
+
 > 一个 Unreal Engine 编辑器插件，可将任意图编辑器（Graph Editor）的完整截图（包括所有节点、含屏幕外区域）捕获到剪贴板。
 >
 > Capture complete screenshots of any graph editor (all nodes, including off-screen) to the clipboard.
@@ -36,6 +38,10 @@
   - ![1786524595325](image/README/1786524595325.png)
 - 截图将自动写入剪贴板，可直接粘贴（`Ctrl+V`）到画图、文档或聊天工具中。
 
+示例：
+
+![1786695086755](image/README/1786695086755.gif)
+
 ### 🎯 选区截图（v1.1+）
 
 当你在图编辑器中选中了部分节点/注释时，**仅捕获选中区域**，其余节点自动隐藏，不干扰截图内容。
@@ -43,6 +49,10 @@
 - 未选中任何节点 → 完整截图（与 v1.0 行为一致）
 - 选中节点/注释 → 仅截取选中区域，自动计算边界 + 适当的 padding
 - 注释（Comment）也参与选区：选中即纳入，不选中则隐藏
+
+示例：
+
+![1786695140411](image/README/1786695140411.gif)
 
 ## 依赖
 
