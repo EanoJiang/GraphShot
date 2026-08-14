@@ -4,6 +4,9 @@
 #include "GraphShotClipboard.h"
 
 #include "EdGraph/EdGraph.h"
+#include "EdGraph/EdGraphNode.h"
+#include "UObject/Object.h"
+#include "UObject/UObjectGlobals.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Notifications/NotificationManager.h"
@@ -15,6 +18,7 @@
 #include "RenderingThread.h"
 #include "RHI.h"
 #include "SGraphPanel.h"
+#include "SGraphNode.h"
 #include "SNodePanel.h"
 #include "Slate/WidgetRenderer.h"
 #include "Styling/AppStyle.h"
@@ -208,6 +212,94 @@ static bool ComputeAllNodeBounds(SGraphPanel& Panel, FSlateRect& OutBounds)
 	return true;
 }
 
+/** Union of node widgets whose underlying graph node is currently selected (graph space).
+ *  Comments participate too: SGraphNodeComment derives from SGraphNode, so a comment
+ *  selected in the live panel is captured exactly like a node.
+ *  Bounds are computed only from widgets present on the temp panel; selected nodes with no
+ *  widget are simply ignored. */
+static bool ComputeSelectedNodeBounds(SNodePanel& Panel, const FGraphSelectionManager& Selection, FSlateRect& OutBounds)
+{
+	FVector2f Min(MAX_FLT, MAX_FLT);
+	FVector2f Max(-MAX_FLT, -MAX_FLT);
+	bool bAny = false;
+
+	FChildren* Kids = Panel.GetManagedChildren();
+	if (!Kids)
+	{
+		return false;
+	}
+
+	for (int32 i = 0; i < Kids->Num(); ++i)
+	{
+		TSharedPtr<SWidget> ChildWidget = Kids->GetChildAt(i);
+		if (!ChildWidget.IsValid())
+		{
+			continue;
+		}
+
+		// It may be a comment, but every managed child on a graph panel is an SGraphNode
+		// (SGraphNodeComment isa SGraphNode), so cast down to the base node widget type.
+		const TSharedPtr<SGraphNode> GraphNodeWidget = StaticCastSharedPtr<SGraphNode>(ChildWidget);
+		if (UEdGraphNode* GraphNode = GraphNodeWidget->GetNodeObj())
+		{
+			if (!Selection.IsNodeSelected(GraphNode))
+			{
+				continue;
+			}
+
+			const FVector2f Pos = GraphNodeWidget->GetPosition2f();
+			const FVector2f Size = GraphNodeWidget->GetDesiredSize();
+
+			Min.X = FMath::Min(Min.X, Pos.X);
+			Min.Y = FMath::Min(Min.Y, Pos.Y);
+			Max.X = FMath::Max(Max.X, Pos.X + Size.X);
+			Max.Y = FMath::Max(Max.Y, Pos.Y + Size.Y);
+			bAny = true;
+		}
+	}
+
+	if (!bAny)
+	{
+		return false;
+	}
+
+	OutBounds = FSlateRect(Min.X, Min.Y, Max.X, Max.Y);
+	return true;
+}
+
+/** Hide every node widget that is NOT currently selected (graph space).
+ *  Comments participate too: FGraphNodeComment derives from FGraphNode, so a comment
+ *  selected in the live graph is captured exactly like a node. Hidden widgets keep
+ *  unselected nodes/comments from appearing above/below the captured region. */
+static void HideUnselectedNodeWidgets(SGraphPanel& Panel, const FGraphSelectionManager& Selection)
+{
+	FChildren* Kids = Panel.GetManagedChildren();
+	if (!Kids)
+	{
+		return;
+	}
+
+	for (int32 i = 0; i < Kids->Num(); ++i)
+	{
+		TSharedPtr<SWidget> ChildWidget = Kids->GetChildAt(i);
+		if (!ChildWidget.IsValid())
+		{
+			continue;
+		}
+
+		// May be a comment, but every managed child on a graph panel is an SGraphNode
+		// (SGraphNodeComment isa SGraphNode), so cast down to the base node widget type.
+		const TSharedPtr<SGraphNode> GraphNodeWidget = StaticCastSharedPtr<SGraphNode>(ChildWidget);
+		if (UEdGraphNode* GraphNode = GraphNodeWidget->GetNodeObj())
+		{
+			if (!Selection.IsNodeSelected(GraphNode))
+			{
+				GraphNodeWidget->SetVisibility(EVisibility::Hidden);
+			}
+		}
+	}
+}
+
 bool FGraphShotCapture::CanCapture()
 {
 	if (!FSlateApplication::IsInitialized())
@@ -251,11 +343,23 @@ bool FGraphShotCapture::CaptureToClipboard()
 	// Create + prepass a widget for every node (valid GetDesiredSize).
 	Panel->Update();
 
+	// If the user has nodes/comments selected in the live graph, capture ONLY that region;
+	// otherwise fall back to the whole graph (original behavior).
 	FSlateRect Bounds;
-	if (!ComputeAllNodeBounds(*Panel, Bounds))
+	const FGraphSelectionManager& Selection = LivePanel->SelectionManager;
+	const bool bHasSelection = Selection.AreAnyNodesSelected() && ComputeSelectedNodeBounds(*Panel, Selection, Bounds);
+
+	if (!bHasSelection && !ComputeAllNodeBounds(*Panel, Bounds))
 	{
 		Notify(LOCTEXT("NoBounds", "Could not compute graph bounds (no node widgets)."), true);
 		return false;
+	}
+
+	// Hide unselected nodes in the temp panel so they don't leak into the
+	// captured region (only applies when there IS a selection).
+	if (bHasSelection)
+	{
+		HideUnselectedNodeWidgets(*Panel, Selection);
 	}
 
 	const FVector2f GraphSize = Bounds.GetSize2f();
