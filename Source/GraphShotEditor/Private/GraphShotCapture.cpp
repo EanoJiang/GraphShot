@@ -5,12 +5,18 @@
 
 #include "EdGraph/EdGraph.h"
 #include "EdGraph/EdGraphNode.h"
+#include "EdGraph/EdGraphPin.h"
+#include "EdGraph/EdGraphSchema.h"
+#include "ConnectionDrawingPolicy.h"
+#include "NodeFactory.h"
+#include "SGraphPin.h"
 #include "UObject/Object.h"
 #include "UObject/UObjectGlobals.h"
 #include "Engine/TextureRenderTarget2D.h"
 #include "Framework/Application/SlateApplication.h"
 #include "Framework/Notifications/NotificationManager.h"
 #include "HAL/IConsoleManager.h"
+#include "Layout/ArrangedChildren.h"
 #include "Layout/ChildrenBase.h"
 #include "Layout/Geometry.h"
 #include "Misc/App.h"
@@ -161,18 +167,286 @@ static TSharedPtr<SGraphPanel> FindActiveGraphPanel()
 	return BestPanel;
 }
 
+// BFS a widget subtree for a set of pin widgets using the public SWidget::ArrangeChildren. SWidget::
+// FindChildGeometries is protected, so it cannot be called on a different widget type (e.g. an SGraphNode
+// from this SGraphPanel subclass); this reproduces its algorithm: arrange the subtree at each level and
+// collect the requested pin widgets' real arranged geometry. The result is the same pin geometry the engine
+// uses for visible nodes, so GetSplineEndPoints (which reads the geometry's AbsolutePosition AND GetDrawSize
+// = size*scale) computes identical wire endpoints -- output pin at its right edge, input pin at its left
+// edge, both vertically centered -- instead of the zero-size cull-path synthesis that misplaces them.
+static void FindPinsInSubtree(
+	const TSharedRef<SWidget>& Root,
+	const FGeometry& RootGeometry,
+	const TSet<TSharedRef<SWidget>>& PinsToFind,
+	TMap<TSharedRef<SWidget>, FArrangedWidget>& OutPinGeometries)
+{
+	TArray<TPair<TSharedRef<SWidget>, FGeometry>> Queue;
+	Queue.Emplace(Root, RootGeometry);
+	for (int32 Head = 0; Head < Queue.Num(); ++Head)
+	{
+		// Copy out before Emplace may reallocate the queue below.
+		const TSharedRef<SWidget> CurWidget = Queue[Head].Key;
+		const FGeometry CurGeometry = Queue[Head].Value;
+
+		FArrangedChildren Arranged(EVisibility::Visible);
+		CurWidget->ArrangeChildren(CurGeometry, Arranged);
+
+		for (int32 i = 0; i < Arranged.Num(); ++i)
+		{
+			const FArrangedWidget& Child = Arranged[i];
+			if (PinsToFind.Contains(Child.Widget))
+			{
+				OutPinGeometries.Add(Child.Widget, Child);
+			}
+			Queue.Emplace(Child.Widget, Child.Geometry);
+		}
+	}
+}
+
+/**
+ * SGraphPanel variant used only for GraphShot's detached capture panel.
+ *
+ * The base SGraphPanel only draws a wire to a node when it can locate that node's pin geometry:
+ *  - visible, in-view nodes  -> real geometry via FindChildGeometries
+ *  - culled, off-screen nodes -> synthesized geometry (the "cull path", which also draws their wires)
+ * GraphShot hides every UNSELECTED node (EVisibility::Hidden) so its body/shadow do not leak into the
+ * capture. A hidden node is absent from VisibleChildren, so FindChildGeometries cannot find its pins and
+ * the base panel draws NO wires to in-view unselected nodes (it still draws wires to culled unselected
+ * nodes via the cull path). The result the user sees: connections from a selected node to a nearby
+ * unselected node vanish.
+ *
+ * This OnPaint override adds exactly the missing wires. After the base panel paints (background, selected
+ * node bodies/shadows/comments/overlays, and the wires it already knows), it synthesizes pin geometry for
+ * the hidden, in-view unselected nodes using the base panel's own cull-path formula and draws the wires
+ * that connect a SELECTED node to one of those nodes, via the graph's real connection policy so the
+ * spline/arrow/style match the base panel exactly. Culled unselected nodes are left to the base panel
+ * (already handled), and wires between two unselected nodes are never drawn.
+ */
+class SGraphShotPanel : public SGraphPanel
+{
+public:
+	/** Build a detached, read-only capture panel over the given graph (same config the old BuildTempPanel used). */
+	static TSharedRef<SGraphShotPanel> Create(UEdGraph* InGraph)
+	{
+		SGraphPanel::FArguments Args;
+		Args.GraphObj(InGraph)
+			.IsEditable(false)
+			.DisplayAsReadOnly(false)
+			.ShowGraphStateOverlay(false)
+			.AllowConnectionSlicing(false)
+			.ShouldDrawBackground(true)
+			.AllowZoom(true)
+			.AllowPanning(false);
+
+		TSharedRef<SGraphShotPanel> Panel = MakeShared<SGraphShotPanel>();
+		Panel->Construct(Args);
+		return Panel;
+	}
+
+	void Construct(const SGraphPanel::FArguments& InArgs)
+	{
+		SGraphPanel::Construct(InArgs);
+	}
+
+	virtual int32 OnPaint(
+		const FPaintArgs& Args,
+		const FGeometry& AllottedGeometry,
+		const FSlateRect& MyCullingRect,
+		FSlateWindowElementList& OutDrawElements,
+		int32 LayerId,
+		const FWidgetStyle& InWidgetStyle,
+		bool bParentEnabled) const override;
+};
+
+int32 SGraphShotPanel::OnPaint(
+	const FPaintArgs& Args,
+	const FGeometry& AllottedGeometry,
+	const FSlateRect& MyCullingRect,
+	FSlateWindowElementList& OutDrawElements,
+	int32 LayerId,
+	const FWidgetStyle& InWidgetStyle,
+	bool bParentEnabled) const
+{
+	// Let the base panel paint the background, the selected node bodies (shadows/comments/overlays/popups),
+	// and the wires it already knows how to draw: selected<->selected, and selected<->culled-unselected
+	// (the cull path synthesizes geometry for off-screen nodes, hidden or not, and draws their wires).
+	const int32 SuperMaxLayerId = SGraphPanel::OnPaint(Args, AllottedGeometry, MyCullingRect, OutDrawElements, LayerId, InWidgetStyle, bParentEnabled);
+
+	if (!GraphObj)
+	{
+		return SuperMaxLayerId;
+	}
+
+	// The base SGraphPanel::OnPaint is also const and iterates the protected `Children` member directly; we
+	// do the same here (GetManagedChildren() is non-const and so cannot be called from this const override).
+	const int32 NumChildren = Children.Num();
+	if (NumChildren == 0)
+	{
+		return SuperMaxLayerId;
+	}
+
+	const UEdGraphSchema* Schema = GraphObj->GetSchema();
+	if (!Schema)
+	{
+		return SuperMaxLayerId;
+	}
+
+	const float ZoomFactor = AllottedGeometry.Scale * GetZoomAmount();
+
+	// The base SGraphPanel only draws a wire to a node when it can locate that node's pin geometry: real for
+	// in-view nodes, synthesized (cull path) for off-screen nodes. GraphShot hides every UNSELECTED node
+	// (EVisibility::Hidden) so it doesn't leak into the shot, which leaves no geometry for the hidden node's
+	// pins and therefore no wires touching it. This OnPaint adds back the wires that touch a hidden, in-view
+	// unselected node.
+	//
+	// IMPORTANT: this detached temp panel carries its OWN empty SelectionManager (selection lives on the live
+	// panel), so "selected" is NOT read from SelectionManager here. It is exactly the inverse of the
+	// Hidden/Visible state the capture flow already set: nodes the user selected stay Visible, unselected
+	// nodes are Hidden. So we drive everything off that visibility.
+	TSet<UEdGraphNode*> HiddenNodes;
+	for (int32 i = 0; i < NumChildren; ++i)
+	{
+		const TSharedRef<SGraphNode> GraphNodeWidget = StaticCastSharedRef<SGraphNode>(Children[i]);
+		if (UEdGraphNode* NodeObj = GraphNodeWidget->GetNodeObj())
+		{
+			if (GraphNodeWidget->GetVisibility() != EVisibility::Visible)
+			{
+				HiddenNodes.Add(NodeObj);
+			}
+		}
+	}
+
+	// No hidden nodes -> this is a whole-graph capture and the base panel already drew every wire.
+	if (HiddenNodes.Num() == 0)
+	{
+		return SuperMaxLayerId;
+	}
+
+	TMap<TSharedRef<SWidget>, FArrangedWidget> PinGeometries;
+
+	// Use REAL arranged pin geometry for EVERY node (including hidden/unselected ones) so the wire endpoints
+	// match the engine exactly. The engine's spline endpoints come from GetSplineEndPoints, which reads the pin
+	// geometry's AbsolutePosition AND GetDrawSize() (size*scale):
+	//   output pin start = (AbsPos.X + DrawSize.X, AbsPos.Y + DrawSize.Y/2)  -- right edge, vertically centered
+	//   input  pin end   = (AbsPos.X,         AbsPos.Y + DrawSize.Y/2)        -- left edge,  vertically centered
+	// The base panel's cull-path synthesizes a ZERO-size geometry for off-screen nodes; that collapses the
+	// output-pin endpoint to the left edge and drops the vertical centering. That is fine for wires running
+	// off-screen, but for in-view hidden nodes it puts the wire's hidden end in the wrong place ("乱").
+	// So instead we arrange each node -- even hidden ones -- and use FindChildGeometries to obtain the true
+	// arranged pin geometry, identical to what the engine uses for visible nodes.
+	for (int32 i = 0; i < NumChildren; ++i)
+	{
+		const TSharedRef<SGraphNode> GraphNodeWidget = StaticCastSharedRef<SGraphNode>(Children[i]);
+
+		// Culled (off-screen) hidden nodes are already handled by the base panel's cull path; skip them.
+		if (GraphNodeWidget->GetVisibility() != EVisibility::Visible && IsNodeCulled(GraphNodeWidget, AllottedGeometry))
+		{
+			continue;
+		}
+
+		// Real node geometry, the same formula SNodePanel::ArrangeChildNodes uses.
+		const FArrangedWidget NodeArranged = AllottedGeometry.MakeChild(
+			StaticCastSharedRef<SWidget>(GraphNodeWidget),
+			GraphNodeWidget->GetPosition2f() - GetViewOffset(),
+			GraphNodeWidget->GetDesiredSize(),
+			GetZoomAmount());
+
+		TSet<TSharedRef<SWidget>> NodePins;
+		GraphNodeWidget->GetPins(NodePins);
+
+		TMap<TSharedRef<SWidget>, FArrangedWidget> NodePinGeoms;
+		FindPinsInSubtree(StaticCastSharedRef<SWidget>(GraphNodeWidget), NodeArranged.Geometry, NodePins, NodePinGeoms);
+		PinGeometries.Append(MoveTemp(NodePinGeoms));
+	}
+
+	if (PinGeometries.Num() == 0)
+	{
+		return SuperMaxLayerId;
+	}
+
+	// Use the graph's real connection policy (via the static FNodeFactory, since this temp panel has no
+	// custom NodeFactory set) so spline/arrow/wire-style match the base panel exactly. Draw the spline below
+	// the nodes (WireLayerId = LayerId + 3, matching the base panel's fixed layer allocation in OnPaint) and
+	// the arrow above everything (SuperMaxLayerId).
+	const int32 WireLayerId = LayerId + 3;
+	TUniquePtr<FConnectionDrawingPolicy> Policy(FNodeFactory::CreateConnectionPolicy(
+		Schema, WireLayerId, SuperMaxLayerId, ZoomFactor, MyCullingRect, OutDrawElements, GraphObj));
+	if (!Policy)
+	{
+		// The schema factory should normally return a policy; fall back to the base policy rather than
+		// silently dropping the wires.
+		Policy = TUniquePtr<FConnectionDrawingPolicy>(new FConnectionDrawingPolicy(WireLayerId, SuperMaxLayerId, ZoomFactor, MyCullingRect, OutDrawElements));
+	}
+
+	// Map UEdGraphPin* -> pin widget (mirrors FConnectionDrawingPolicy::BuildPinToPinWidgetMap) so each
+	// link's target end can be resolved and its fade state read.
+	TMap<UEdGraphPin*, TSharedRef<SGraphPin>> PinToWidget;
+	for (const TPair<TSharedRef<SWidget>, FArrangedWidget>& Pair : PinGeometries)
+	{
+		const TSharedRef<SWidget>& PinWidget = Pair.Key;
+		SGraphPin& Pin = static_cast<SGraphPin&>(PinWidget.Get());
+		if (UEdGraphPin* PinObj = Pin.GetPinObj())
+		{
+			PinToWidget.Add(PinObj, StaticCastSharedRef<SGraphPin>(PinWidget));
+		}
+	}
+
+	// Draw only the wires that connect a KEPT (selected) node to a HIDDEN (unselected) node -- the ones the
+	// base panel missed (the base panel draws kept<->kept, and kept<->culled-hidden via the cull path). Wires
+	// between two hidden nodes must not appear (only the kept nodes' connections are wanted).
+	for (const TPair<TSharedRef<SWidget>, FArrangedWidget>& Pair : PinGeometries)
+	{
+		const TSharedRef<SWidget> PinWidget = Pair.Key;
+		SGraphPin& Pin = static_cast<SGraphPin&>(PinWidget.Get());
+		UEdGraphPin* ThePin = Pin.GetPinObj();
+		if (!ThePin || ThePin->Direction != EGPD_Output)
+		{
+			continue;
+		}
+
+		const bool bStartHidden = HiddenNodes.Contains(ThePin->GetOwningNode());
+
+		for (UEdGraphPin* TargetPin : ThePin->LinkedTo)
+		{
+			const TSharedRef<SGraphPin>* TargetWidgetPtr = PinToWidget.Find(TargetPin);
+			if (!TargetWidgetPtr)
+			{
+				continue; // target not in our geometry set (culled, or a collapsed pin) -> base handled or N/A
+			}
+
+			const bool bEndHidden = HiddenNodes.Contains(TargetPin->GetOwningNode());
+			if (bStartHidden == bEndHidden)
+			{
+				continue; // both kept (base drew it) or both hidden (must not draw)
+			}
+
+			const FArrangedWidget* StartGeom = PinGeometries.Find(PinWidget);
+			const FArrangedWidget* EndGeom = PinGeometries.Find(*TargetWidgetPtr);
+			if (!StartGeom || !EndGeom)
+			{
+				continue;
+			}
+
+			FConnectionParams Params;
+			Policy->DetermineWiringStyle(ThePin, TargetPin, Params);
+
+			// Match the base panel's fade rule: if both ends are faded, dim the wire.
+			if (Pin.AreConnectionsFaded() && (*TargetWidgetPtr)->AreConnectionsFaded())
+			{
+				Params.WireColor.A = 0.2f;
+			}
+
+			Policy->DrawSplineWithArrow(StartGeom->Geometry, EndGeom->Geometry, Params);
+		}
+	}
+
+	return SuperMaxLayerId;
+}
+
 /** Build a detached, read-only temp panel over the given graph. It only reads Graph->Nodes and owns its own widgets. */
 static TSharedPtr<SGraphPanel> BuildTempPanel(UEdGraph* Graph)
 {
-	return SNew(SGraphPanel)
-		.GraphObj(Graph)
-		.IsEditable(false)
-		.DisplayAsReadOnly(false)
-		.ShowGraphStateOverlay(false)
-		.AllowConnectionSlicing(false)
-		.ShouldDrawBackground(true)
-		.AllowZoom(true)
-		.AllowPanning(false);
+	return SGraphShotPanel::Create(Graph);
 }
 
 /** Union of every node widget's position + desired size (graph space). */
@@ -355,13 +629,6 @@ bool FGraphShotCapture::CaptureToClipboard()
 		return false;
 	}
 
-	// Hide unselected nodes in the temp panel so they don't leak into the
-	// captured region (only applies when there IS a selection).
-	if (bHasSelection)
-	{
-		HideUnselectedNodeWidgets(*Panel, Selection);
-	}
-
 	const FVector2f GraphSize = Bounds.GetSize2f();
 	const float Pad = 64.0f;
 	const float MaxTex = FMath::Min((float)GetMax2DTextureDimension(), 8192.f);
@@ -399,6 +666,17 @@ bool FGraphShotCapture::CaptureToClipboard()
 	// prepasses; it never ticks, so VisibleChildren must be populated here first.
 	const FGeometry TickGeo = FGeometry::MakeRoot(FVector2f((float)Width, (float)Height), FSlateLayoutTransform(1.0f));
 	Panel->Tick(TickGeo, FApp::GetCurrentTime(), 0.0f);
+
+	// Hide unselected nodes AFTER the tick. SGraphPin::Tick caches each pin's offset within its node
+	// (CachedNodeOffset), and SGraphShotPanel::OnPaint synthesizes the hidden end of each wire from that
+	// cache using the same formula as the engine's cull path. A Hidden node is never ticked, so hiding
+	// before the tick would leave those offsets stale and the wires to hidden nodes would land in the
+	// wrong place ("乱"). Ticking first -- with every node visible, at the render view/zoom -- populates
+	// every in-view pin's offset, THEN we hide so only the selected node bodies are kept off-screen.
+	if (bHasSelection)
+	{
+		HideUnselectedNodeWidgets(*Panel, Selection);
+	}
 
 	// Render the panel into a render target at the chosen size.
 	// The RT sRGB base is selectable via GraphShot.UseGamma (1 = sRGB RT, brighter; 0 = linear RT, darker).
